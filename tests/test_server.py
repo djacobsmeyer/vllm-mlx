@@ -2237,6 +2237,8 @@ class TestStreamChatCompletion:
             "prompt_tokens": 5,
             "completion_tokens": 7,
             "total_tokens": 12,
+            # Prefix-cache reuse is surfaced OpenAI-style; no reuse here -> 0.
+            "prompt_tokens_details": {"cached_tokens": 0},
         }
 
     @pytest.mark.anyio
@@ -2971,6 +2973,8 @@ class TestStreamChatCompletion:
             "prompt_tokens": 7,
             "completion_tokens": 3,
             "total_tokens": 10,
+            # Prefix-cache reuse is surfaced OpenAI-style; no reuse here -> 0.
+            "prompt_tokens_details": {"cached_tokens": 0},
         }
 
     @pytest.mark.anyio
