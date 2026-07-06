@@ -678,6 +678,10 @@ class MLLMScheduler:
                 output_token_ids=request.output_tokens,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                # MLLM does not yet track prefix-cache reuse at the request
+                # level; thread it defensively so it surfaces automatically if
+                # ``cached_tokens`` is ever populated here.
+                cached_tokens=getattr(request, "cached_tokens", 0),
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
             )
