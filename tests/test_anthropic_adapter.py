@@ -253,6 +253,42 @@ class TestConvertMessage:
         assert result[0].role == "user"
         assert result[0].content == ""
 
+    def test_mid_conversation_system_role_demoted_to_user(self):
+        """Regression (local-fix.md): Claude Code's Agent SDK sends
+        mid-conversation <system-reminder> blocks as role="system" entries
+        inside `messages` (separate from the top-level `system` field).
+        Forwarding that role verbatim produces a second, non-leading
+        system-role message that many chat templates (e.g. Qwen3.6's) hard
+        -reject with 'System message must be at the beginning.' It must be
+        demoted to "user" so it renders at its original turn position."""
+        msg = AnthropicMessage(
+            role="system",
+            content=[
+                AnthropicContentBlock(
+                    type="text", text="<system-reminder>\ncontext\n</system-reminder>"
+                ),
+            ],
+        )
+        result = _convert_message(msg)
+        assert len(result) == 1
+        assert result[0].role == "user"
+        assert result[0].content == "<system-reminder>\ncontext\n</system-reminder>"
+
+    def test_mid_conversation_system_role_string_content_demoted(self):
+        """Regression: the real failing request (local-fix.md) sends the
+        mid-conversation role="system" message with plain STRING content,
+        not a content-block list -- which hits `_convert_message`'s early
+        'Simple string content' return. That path must demote role="system"
+        too, or the early return silently bypasses the fix above."""
+        msg = AnthropicMessage(
+            role="system",
+            content="<system-reminder>\ncontext\n</system-reminder>",
+        )
+        result = _convert_message(msg)
+        assert len(result) == 1
+        assert result[0].role == "user"
+        assert result[0].content == "<system-reminder>\ncontext\n</system-reminder>"
+
 
 class TestAnthropicToOpenai:
     """Tests for anthropic_to_openai conversion."""
@@ -359,6 +395,40 @@ class TestAnthropicToOpenai:
         assert result.messages[0].role == "user"
         assert result.messages[1].role == "assistant"
         assert result.messages[2].role == "user"
+
+    def test_real_claude_code_shape_no_mid_conversation_system(self):
+        """Regression (local-fix.md): reproduces the exact real-world shape
+        that 500'd Qwen3.6 (local-diagnostic.md §5) -- a top-level `system`
+        field (list of blocks) plus a `messages` array containing a
+        role="system" entry (Claude Code's mid-turn <system-reminder>).
+        Exactly one system-role message must survive, and it must be
+        messages[0], or downstream chat templates raise.
+        """
+        msgs = [
+            AnthropicMessage(role="user", content="Run ls and report the count."),
+            AnthropicMessage(
+                role="system",
+                content="<system-reminder>\nAs you answer...\n</system-reminder>",
+            ),
+        ]
+        req = self._make_request(
+            system=[{"type": "text", "text": "You are a coding agent."}],
+            messages=msgs,
+        )
+        result = anthropic_to_openai(req)
+
+        system_indices = [
+            i for i, m in enumerate(result.messages) if m.role == "system"
+        ]
+        assert system_indices == [0], (
+            f"expected exactly one system message at index 0, "
+            f"got system messages at {system_indices} of "
+            f"{[m.role for m in result.messages]}"
+        )
+        assert result.messages[1].role == "user"
+        assert result.messages[1].content == "Run ls and report the count."
+        assert result.messages[2].role == "user"
+        assert "<system-reminder>" in result.messages[2].content
 
 
 class TestOpenaiToAnthropic:
