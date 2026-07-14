@@ -17,6 +17,7 @@ from .abstract_tool_parser import (
     ToolParserManager,
 )
 from .gemma4_tool_parser import Gemma4ToolParser
+from .glm47_tool_parser import Glm47ToolParser
 
 
 def generate_tool_id() -> str:
@@ -31,18 +32,30 @@ class AutoToolParser(ToolParser):
 
     Tries multiple formats in order:
     1. Gemma 4: <|tool_call>call:name{...}<tool_call|>
-    2. Mistral: [TOOL_CALLS] ...
-    3. Qwen bracket: [Calling tool: func_name({...})]
-    4. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    5. Llama: <function=name>{"arg": "value"}</function>
-    6. Nemotron: <tool_call><function=name>...</function></tool_call>
-    7. Raw JSON: {"name": "...", "arguments": {...}}
+    2. GLM-4.7: <tool_call>name\n<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+    3. Mistral: [TOOL_CALLS] ...
+    4. Qwen bracket: [Calling tool: func_name({...})]
+    5. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    6. Llama: <function=name>{"arg": "value"}</function>
+    7. Nemotron: <tool_call><function=name>...</function></tool_call>
+    8. Raw JSON: {"name": "...", "arguments": {...}}
 
     This is the default parser when no specific parser is selected.
     """
 
     # Patterns for different formats
     MISTRAL_TOKEN = "[TOOL_CALLS]"
+
+    # GLM-4.7's native format opens with a bare function name right after
+    # <tool_call> (e.g. "Bash\n<arg_key>..." or "Bash</tool_call>" for a
+    # no-arg call). Qwen/Hermes's XML format opens with a JSON object
+    # ("{...}") instead, so anchoring on a leading identifier char keeps
+    # this from ever matching Qwen's blob (see local-diagnostic.md §1.3 —
+    # Glm47ToolParser's own FUNC_DETAIL_PATTERN is ambiguous and DOES match
+    # Qwen's blob, so detection here must be stricter than that pattern).
+    GLM_NATIVE_PATTERN = re.compile(
+        r"<tool_call>\s*[A-Za-z_][\w.]*\s*(?:\n|<arg_key>|</tool_call>)"
+    )
 
     QWEN_BRACKET_PATTERN = re.compile(
         r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]", re.DOTALL
@@ -71,6 +84,17 @@ class AutoToolParser(ToolParser):
         if "<|tool_call>" in model_output:
             gemma_parser = Gemma4ToolParser()
             result = gemma_parser.extract_tool_calls(model_output, request)
+            if result.tools_called:
+                return result
+
+        # 1b. Try GLM-4.7 native format (bare name after <tool_call>, not
+        # JSON) before falling through to the Qwen/Hermes XML pattern below,
+        # which expects a JSON object there instead.
+        if "<tool_call>" in model_output and self.GLM_NATIVE_PATTERN.search(
+            model_output
+        ):
+            glm_parser = Glm47ToolParser()
+            result = glm_parser.extract_tool_calls(model_output, request)
             if result.tools_called:
                 return result
 
