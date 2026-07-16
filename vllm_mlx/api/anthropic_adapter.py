@@ -177,7 +177,11 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     """
     # Simple string content
     if isinstance(msg.content, str):
-        return [Message(role=msg.role, content=msg.content)]
+        # See the role == "system" branch below: mid-conversation
+        # role="system" messages must not reach the template as a second,
+        # non-leading system message.
+        role = "user" if msg.role == "system" else msg.role
+        return [Message(role=role, content=msg.content)]
 
     # Content is a list of blocks
     messages = []
@@ -253,6 +257,18 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
         # If no text and no tool results, add empty user message
         if not text_parts and not tool_results:
             messages.append(Message(role="user", content=""))
+    elif msg.role == "system":
+        # Claude Code's Agent SDK sends mid-conversation <system-reminder>
+        # blocks as role="system" entries inside `messages` (distinct from
+        # the top-level `system` field, which is handled separately above).
+        # Many chat templates (e.g. Qwen3.6's) raise a hard error if any
+        # message other than the very first has role "system" — see
+        # local-diagnostic.md §5 / local-fix.md. Demote it to "user" so it
+        # renders at its original conversational position instead of being
+        # dropped or merged into the leading system prompt, which would
+        # lose the turn-specific context it's tied to.
+        combined_text = "\n".join(text_parts) if text_parts else ""
+        messages.append(Message(role="user", content=combined_text))
     else:
         # Other roles
         combined_text = "\n".join(text_parts) if text_parts else ""

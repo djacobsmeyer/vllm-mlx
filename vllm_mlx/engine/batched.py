@@ -791,6 +791,7 @@ class BatchedEngine(BaseEngine):
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
+                cached_tokens=getattr(output, "cached_tokens", 0),
                 finish_reason=output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
@@ -823,6 +824,7 @@ class BatchedEngine(BaseEngine):
             tokens=output.output_token_ids,
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
+            cached_tokens=getattr(output, "cached_tokens", 0),
             finish_reason=output.finish_reason,
         )
 
@@ -881,6 +883,7 @@ class BatchedEngine(BaseEngine):
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
+                    cached_tokens=getattr(output, "cached_tokens", 0),
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
@@ -918,6 +921,7 @@ class BatchedEngine(BaseEngine):
                 new_text=output.new_text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
+                cached_tokens=getattr(output, "cached_tokens", 0),
                 finished=output.finished,
                 finish_reason=output.finish_reason,
             )
