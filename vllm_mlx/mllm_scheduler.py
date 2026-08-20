@@ -852,8 +852,14 @@ class MLLMScheduler:
             self.batch_generator = None
 
         if self._ssd_tier is not None:
-            self._ssd_tier.close()
-            self._ssd_tier = None
+            tier = self._ssd_tier
+            aclose = getattr(tier, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await asyncio.to_thread(tier.close)
+            if self._ssd_tier is tier:
+                self._ssd_tier = None
             logger.info("SSD cache tier closed")
 
         logger.info("MLLM Scheduler stopped")

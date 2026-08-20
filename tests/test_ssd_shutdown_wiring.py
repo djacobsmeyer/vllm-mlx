@@ -10,6 +10,9 @@ now drains and joins the writer thread. Model-free: no real MLX model is
 loaded, only a real `SSDCacheTier` (fast, disk-only).
 """
 
+import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -49,6 +52,32 @@ def _tier_with_queued_spill(tmp_path):
 
 class TestEngineCoreStopClosesSSDTier:
     """Text engine: EngineCore.stop() must close the scheduler's SSD tier."""
+
+    @pytest.mark.anyio
+    async def test_start_recreates_configured_ssd_tier(self):
+        from vllm_mlx.engine_core import EngineCore
+
+        engine = object.__new__(EngineCore)
+        engine._running = False
+        engine._task = None
+
+        class RestartScheduler:
+            def __init__(self):
+                self.ensure_calls = 0
+
+            def ensure_ssd_tier(self):
+                self.ensure_calls += 1
+
+        async def empty_loop():
+            engine._running = False
+
+        engine.scheduler = RestartScheduler()
+        engine._engine_loop = empty_loop
+
+        await engine.start()
+        await engine._task
+
+        assert engine.scheduler.ensure_calls == 1
 
     @pytest.mark.anyio
     async def test_stop_joins_writer_thread_and_clears_tier(self, tmp_path):
@@ -94,6 +123,46 @@ class TestEngineCoreStopClosesSSDTier:
 
         assert tier._stats.spill_count == 1
 
+    @pytest.mark.anyio
+    async def test_stop_keeps_event_loop_responsive_while_ssd_closes(self):
+        from vllm_mlx.engine_core import EngineCore
+
+        engine = object.__new__(EngineCore)
+        engine._running = False
+        engine._task = None
+        release_close = threading.Event()
+        close_finished = threading.Event()
+        heartbeat_ran_during_close = False
+
+        class BlockingScheduler:
+            def _close_batch_generator(self):
+                pass
+
+            def close_ssd_tier(self):
+                assert release_close.wait(timeout=2.0)
+                close_finished.set()
+
+        async def heartbeat():
+            nonlocal heartbeat_ran_during_close
+            await asyncio.sleep(0)
+            heartbeat_ran_during_close = not close_finished.is_set()
+
+        engine.scheduler = BlockingScheduler()
+        heartbeat_task = asyncio.create_task(heartbeat())
+        release_timer = threading.Timer(0.1, release_close.set)
+        release_timer.start()
+
+        try:
+            await engine.stop()
+            await heartbeat_task
+        finally:
+            release_close.set()
+            release_timer.cancel()
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+
+        assert heartbeat_ran_during_close
+
 
 class TestMLLMSchedulerStopClosesSSDTier:
     """MLLM engine: MLLMScheduler.stop() must close its own SSD tier."""
@@ -128,6 +197,39 @@ class TestMLLMSchedulerStopClosesSSDTier:
 
         assert tier.closed is True
         assert sched._ssd_tier is None
+
+    @pytest.mark.anyio
+    async def test_stop_keeps_event_loop_responsive_while_ssd_closes(self):
+        sched = self._bare_scheduler()
+        release_close = threading.Event()
+        close_finished = threading.Event()
+        heartbeat_ran_during_close = False
+
+        class BlockingTier:
+            def close(self):
+                assert release_close.wait(timeout=2.0)
+                close_finished.set()
+
+        async def heartbeat():
+            nonlocal heartbeat_ran_during_close
+            await asyncio.sleep(0)
+            heartbeat_ran_during_close = not close_finished.is_set()
+
+        sched._ssd_tier = BlockingTier()
+        heartbeat_task = asyncio.create_task(heartbeat())
+        release_timer = threading.Timer(0.1, release_close.set)
+        release_timer.start()
+
+        try:
+            await sched.stop()
+            await heartbeat_task
+        finally:
+            release_close.set()
+            release_timer.cancel()
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+
+        assert heartbeat_ran_during_close
 
     @pytest.mark.anyio
     async def test_stop_joins_real_writer_thread(self, tmp_path):
@@ -183,3 +285,61 @@ class TestMLLMSchedulerStopClosesSSDTier:
         sched = MLLMScheduler(SimpleNamespace(), processor, MLLMSchedulerConfig())
 
         assert sched._ssd_tier is None
+
+
+class TestSchedulerSSDTierLifecycle:
+    def test_closed_tier_is_detached_and_recreated_for_restart(self, monkeypatch):
+        import vllm_mlx.scheduler as scheduler_module
+        from vllm_mlx.scheduler import Scheduler
+
+        created_tiers = []
+
+        class FakeTier:
+            def __init__(self, config):
+                self.config = config
+                self.started = False
+                self.reconciled = False
+                self.closed = False
+                created_tiers.append(self)
+
+            def start_writer(self):
+                self.started = True
+
+            def reconcile(self):
+                self.reconciled = True
+
+            def close(self):
+                self.closed = True
+
+        class FakeMemoryCache:
+            def __init__(self):
+                self._ssd_tier = None
+
+            def set_ssd_tier(self, tier):
+                self._ssd_tier = tier
+
+        monkeypatch.setattr(scheduler_module, "SSDCacheTier", FakeTier)
+        scheduler = object.__new__(Scheduler)
+        scheduler.config = SimpleNamespace(
+            ssd_cache_dir="/cache",
+            ssd_cache_max_gb=2.0,
+        )
+        scheduler.memory_aware_cache = FakeMemoryCache()
+        scheduler._ssd_tier = None
+
+        scheduler.ensure_ssd_tier()
+        first_tier = scheduler._ssd_tier
+        scheduler.close_ssd_tier()
+
+        assert first_tier.closed
+        assert scheduler._ssd_tier is None
+        assert scheduler.memory_aware_cache._ssd_tier is None
+
+        scheduler.ensure_ssd_tier()
+
+        assert len(created_tiers) == 2
+        assert scheduler._ssd_tier is created_tiers[1]
+        assert scheduler._ssd_tier is not first_tier
+        assert scheduler._ssd_tier.started
+        assert scheduler._ssd_tier.reconciled
+        assert scheduler.memory_aware_cache._ssd_tier is scheduler._ssd_tier

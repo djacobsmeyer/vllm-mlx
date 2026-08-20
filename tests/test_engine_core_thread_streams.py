@@ -36,6 +36,7 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
             self.calls = 0
             self.step_threads: list[int] = []
             self.close_threads: list[int] = []
+            self.ssd_close_threads: list[int] = []
 
         def has_requests(self):
             return self.calls < 3
@@ -51,7 +52,7 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
             self.close_threads.append(threading.get_ident())
 
         def close_ssd_tier(self):
-            pass
+            self.ssd_close_threads.append(threading.get_ident())
 
     scheduler = FakeScheduler()
     engine.scheduler = scheduler
@@ -68,6 +69,8 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
     assert scheduler.step_threads[0] != main_thread
     assert bind_threads == [scheduler.step_threads[0]]
     assert scheduler.close_threads == [scheduler.step_threads[0]]
+    assert scheduler.ssd_close_threads
+    assert scheduler.ssd_close_threads[0] != main_thread
 
 
 @pytest.mark.anyio
