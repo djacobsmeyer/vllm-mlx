@@ -123,6 +123,7 @@ class MLLMRequest:
     num_output_tokens: int = 0
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    cached_tokens: int = 0  # Prompt tokens served from the prefix cache (0 = miss)
 
     # Timing
     first_token_time: Optional[float] = None
@@ -684,6 +685,10 @@ class MLLMScheduler:
                 request.mtp_drafts += response.mtp_attempted_count
             if response.from_draft:
                 request.mtp_accepted += 1
+            # Set once at prefill, not accumulated: response.cached_tokens is
+            # the same stable value on every response for this request's
+            # lifetime (the batch generator's MLLMBatchRequest carries it).
+            request.cached_tokens = response.cached_tokens
 
             if request.first_token_time is None and request.num_output_tokens > 0:
                 request.first_token_time = time.time()
@@ -708,9 +713,11 @@ class MLLMScheduler:
                 output_token_ids=request.output_tokens,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
-                # MLLM does not yet track prefix-cache reuse at the request
-                # level; thread it defensively so it surfaces automatically if
-                # ``cached_tokens`` is ever populated here.
+                # Populated from MLLMBatchGenerator's fetch-site accounting via
+                # response.cached_tokens above; getattr kept defensively in
+                # case a future request type reaches this path without the
+                # field (e.g. the error-response branch's plain Request-less
+                # construction elsewhere in this method).
                 cached_tokens=getattr(request, "cached_tokens", 0),
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
