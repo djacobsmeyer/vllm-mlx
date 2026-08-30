@@ -253,6 +253,10 @@ class MLLMScheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Count of step() calls, mirroring AsyncEngineCore._steps_executed
+        # (engine_core.py) for the plain-LLM path -- surfaced via get_stats()
+        # as vllm_mlx_engine_steps_executed (see #746).
+        self._steps_executed = 0
 
         # Memory management: periodic mx.clear_cache() to free Metal buffers
         self._step_count = 0
@@ -786,6 +790,7 @@ class MLLMScheduler:
             MLLMSchedulerOutput with results of this step
         """
         output = MLLMSchedulerOutput()
+        self._steps_executed += 1
 
         # Drain any deferred removals queued from other threads (e.g.
         # the asyncio event loop during client-disconnect aborts).
@@ -1242,6 +1247,7 @@ class MLLMScheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "steps_executed": self._steps_executed,
             "requests": self.get_running_requests_info(),
         }
 

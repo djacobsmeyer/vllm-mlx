@@ -170,6 +170,10 @@ class TestMetricsEndpoint:
         assert (
             'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
         )
+        # get_stats()["steps_executed"] must reach the gauge -- the
+        # duck-typed read side of #746 (the producer side, MLLMScheduler /
+        # BatchedEngine, is covered by test_mllm_steps_executed_stat.py).
+        assert "vllm_mlx_engine_steps_executed 7.0" in response.text
 
     def test_metrics_collapse_unmatched_paths(self, metrics_client, monkeypatch):
         client, server, collector = metrics_client
