@@ -8,6 +8,8 @@ non-streaming and (the historically broken) streaming chat completion paths.
 """
 
 import json
+import platform
+import sys
 
 import pytest
 
@@ -228,3 +230,75 @@ class TestChatCompletionCachedTokens:
         # Every usage-bearing chunk reports the cache reuse.
         for usage in usages:
             assert usage["prompt_tokens_details"] == {"cached_tokens": 15}
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or platform.machine() != "arm64",
+    reason="Requires MLX (vllm_mlx.mllm_scheduler imports mlx.core)",
+)
+class TestAbortAndReuseRequestId:
+    """Aborting a request must not leak cache accounting into a reused ID.
+
+    The MLLM scheduler pools requests by ``request_id`` in several dicts
+    (``requests``, ``running``, ``request_id_to_uid``/``uid_to_request_id``).
+    A client is free to reuse a request ID once the previous request has
+    finished/aborted; the request-lifetime contract is that ``add_request``
+    always creates a brand-new ``MLLMRequest``, so ``cached_tokens`` and its
+    high-water mark ``peak_cached_tokens`` must start fresh at 0 rather than
+    inheriting whatever the aborted request last reported.
+    """
+
+    def _make_scheduler(self):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        class FakeTokenizer:
+            eos_token_id = None
+
+            def encode(self, text):
+                return [1, 2, 3]
+
+        class FakeProcessor:
+            tokenizer = FakeTokenizer()
+
+        class FakeModel:
+            config = None
+
+        return MLLMScheduler(model=FakeModel(), processor=FakeProcessor())
+
+    def test_abort_mid_flight_then_reuse_request_id_gives_fresh_peak(self):
+        from vllm_mlx.request import RequestStatus
+
+        scheduler = self._make_scheduler()
+        request_id = "dup-request-id"
+
+        scheduler.add_request(prompt="hello", request_id=request_id, max_tokens=8)
+        first = scheduler.requests[request_id]
+
+        # Simulate the request having progressed far enough to record a
+        # prefix-cache hit before the client disconnects mid-flight.
+        first.status = RequestStatus.RUNNING
+        first.cached_tokens = 42
+        first.peak_cached_tokens = 42
+        scheduler.waiting.remove(first)
+        scheduler.running[request_id] = first
+        scheduler.request_id_to_uid[request_id] = 7
+        scheduler.uid_to_request_id[7] = request_id
+
+        assert scheduler.abort_request(request_id) is True
+
+        # Abort must fully clear the ID from every bookkeeping structure --
+        # a stale entry in any of these would let the old request's state
+        # leak into the reused ID below.
+        assert request_id not in scheduler.requests
+        assert request_id not in scheduler.running
+        assert request_id not in scheduler.request_id_to_uid
+        assert 7 not in scheduler.uid_to_request_id
+
+        # Client reuses the same request ID for an unrelated new request.
+        scheduler.add_request(prompt="hello again", request_id=request_id, max_tokens=8)
+        second = scheduler.requests[request_id]
+
+        assert second is not first
+        assert second.status == RequestStatus.WAITING
+        assert second.cached_tokens == 0
+        assert second.peak_cached_tokens == 0
