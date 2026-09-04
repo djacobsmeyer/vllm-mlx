@@ -119,6 +119,23 @@ jobs:
           file: ./coverage.xml
           fail_ci_if_error: false
 
+      - name: Run MLX-stubbed metrics/scheduler tests
+        # Deliberately its own step (fresh process), not merged into "Run
+        # unit tests (no MLX required)" above: these two files install a
+        # MagicMock-backed mlx/mlx_lm stub (tests/_mlx_stub.py) so their
+        # mlx.core-importing dependencies load without the real package.
+        # Several files in the step above (e.g. test_memory_cache.py,
+        # test_prefix_cache.py) have their own real `except ImportError`
+        # mlx-optional handling that a stub in the same sys.modules/process
+        # would silently break (isinstance() against a MagicMock raises
+        # TypeError instead of behaving like "mlx absent") -- see
+        # tests/_mlx_stub.py's docstring. Refs #746 / PR #749 review.
+        run: |
+          pytest \
+            tests/test_metrics.py \
+            tests/test_mllm_steps_executed_stat.py \
+            -v --tb=short
+
   test-python-3-14:
     # Focused job for the CPython 3.14+ asyncio.shield() behavior change
     # that shield_task() (vllm_mlx/engine/base.py) works around -- the
@@ -179,6 +196,7 @@ jobs:
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
             tests/test_mllm_steps_executed_stat.py \
+            tests/test_metrics.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \

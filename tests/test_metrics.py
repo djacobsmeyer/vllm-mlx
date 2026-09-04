@@ -1,16 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Prometheus server metrics."""
+"""Tests for Prometheus server metrics.
 
-import platform
-import sys
+Everything here exercises the metrics endpoint against a FastAPI TestClient
+with a fake/monkeypatched engine -- no real MLX operation runs. It used to
+be gated to Apple Silicon only, but that was never actually about needing
+real MLX: importing ``vllm_mlx.server`` just needs ``mlx.core`` importable,
+which ``_mlx_stub.install_if_unavailable()`` below provides on runners
+without the real package. This file previously wasn't selected by any CI
+job at all (see #746 / PR #749's review) -- it now runs in a dedicated
+Linux-matrix step (kept separate from files with their own real
+``except ImportError`` mlx-optional handling, e.g. test_memory_cache.py --
+see _mlx_stub.py's docstring) and in the Apple job, where mlx is real and
+this stub never engages.
+"""
+
+from tests import _mlx_stub
+
+_mlx_stub.install_if_unavailable()
 
 import pytest
-
-# Skip all tests if not on Apple Silicon
-pytestmark = pytest.mark.skipif(
-    sys.platform != "darwin" or platform.machine() != "arm64",
-    reason="Requires Apple Silicon",
-)
 
 
 class FakeEngine:
