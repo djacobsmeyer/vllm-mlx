@@ -790,7 +790,6 @@ class MLLMScheduler:
             MLLMSchedulerOutput with results of this step
         """
         output = MLLMSchedulerOutput()
-        self._steps_executed += 1
 
         # Drain any deferred removals queued from other threads (e.g.
         # the asyncio event loop during client-disconnect aborts).
@@ -844,6 +843,16 @@ class MLLMScheduler:
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
+
+        # Count only steps that complete without raising, mirroring
+        # AsyncEngineCore._steps_executed (engine_core.py), which increments
+        # after self.scheduler.step() returns successfully rather than
+        # before calling it. A step that raises partway through (e.g. an
+        # unrecoverable forward-pass error -- see
+        # _fail_requests_after_step_error) never did the scheduling/
+        # generation work "steps_executed" is meant to count, so it must
+        # not be counted.
+        self._steps_executed += 1
 
         return output
 
