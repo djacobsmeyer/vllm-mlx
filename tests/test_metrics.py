@@ -1,24 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Prometheus server metrics.
 
-Everything here exercises the metrics endpoint against a FastAPI TestClient
-with a fake/monkeypatched engine -- no real MLX operation runs. It used to
-be gated to Apple Silicon only, but that was never actually about needing
-real MLX: importing ``vllm_mlx.server`` just needs ``mlx.core`` importable,
-which ``_mlx_stub.install_if_unavailable()`` below provides on runners
-without the real package. This file previously wasn't selected by any CI
-job at all (see #746 / PR #749's review) -- it now runs in a dedicated
-Linux-matrix step (kept separate from files with their own real
-``except ImportError`` mlx-optional handling, e.g. test_memory_cache.py --
-see _mlx_stub.py's docstring) and in the Apple job, where mlx is real and
-this stub never engages.
+Runs against a real FastAPI TestClient built from vllm_mlx.server, which
+pulls in the full server dependency chain (uvicorn, fastapi, prometheus-client,
+mlx.core). Kept Apple-Silicon-only rather than mlx-stubbed: unlike
+test_mllm_steps_executed_stat.py's mlx.core-only need, this file's import
+chain also needs uvicorn/prometheus-client, neither of which the Linux
+test-matrix job installs (see PR #749's review -- an earlier version of
+this file ran here via tests/_mlx_stub.py and errored at fixture setup
+with ModuleNotFoundError: No module named 'uvicorn'). The one assertion
+that specifically needed Linux coverage (get_stats()["steps_executed"]
+reaching the vllm_mlx_engine_steps_executed gauge) now has a dependency-light
+equivalent in test_mllm_steps_executed_stat.py's
+TestMetricsEngineStepsExecutedGauge, which calls MetricsCollector directly
+and needs neither uvicorn nor a real prometheus_client registry. This file
+still runs in the Apple job for full HTTP-layer integration coverage.
 """
 
-from tests import _mlx_stub
-
-_mlx_stub.install_if_unavailable()
+import platform
+import sys
 
 import pytest
+
+# Skip all tests if not on Apple Silicon
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin" or platform.machine() != "arm64",
+    reason="Requires Apple Silicon",
+)
 
 
 class FakeEngine:
