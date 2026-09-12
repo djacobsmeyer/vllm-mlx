@@ -486,3 +486,53 @@ class TestMetricsMiddlewareStreamingTiming:
 
         assert received == [b'{"id": "cmpl-1", "object": "chat.completion"}']
         assert self._inflight_value(collector, self.PATH) == 0.0
+
+    @pytest.mark.anyio
+    async def test_send_failure_mid_stream_settles_at_request_exit(self, monkeypatch):
+        """Reproduces the PR #782 review finding (Thump604): on the real
+        Starlette `_StreamingResponse.__call__` path, `send()` raising
+        mid-stream (e.g. a genuine client disconnect) abandons
+        `body_iterator` without ever closing it -- `async for`/`await` do
+        not call `aclose()` on early termination via a propagated
+        exception. `body_iterator`-only wrapping settles metrics only
+        whenever that abandoned generator happens to be garbage-collected,
+        not at request exit. This must settle synchronously instead, the
+        moment the response's ASGI call raises."""
+        server, collector, request = self._make_collector_and_request(monkeypatch)
+
+        class FakeASGIStreamingResponse:
+            """Minimal stand-in for Starlette's `_StreamingResponse`:
+            `__call__` mirrors its body-iteration loop exactly (no
+            try/finally of its own around it), so a `send()` failure
+            propagates straight out, leaving `body_iterator` suspended
+            mid-yield -- exactly like the real object this stands in for."""
+
+            def __init__(self, body_iterator, status_code=200):
+                self.body_iterator = body_iterator
+                self.status_code = status_code
+
+            async def __call__(self, scope, receive, send):
+                async for chunk in self.body_iterator:
+                    await send({"type": "http.response.body", "body": chunk})
+
+        async def slow_body():
+            yield b"first chunk"
+            yield b"second chunk"  # never reached -- send() dies on the first
+
+        async def call_next(_request):
+            return FakeASGIStreamingResponse(slow_body(), status_code=200)
+
+        response = await server._metrics_middleware(request, call_next)
+        assert self._inflight_value(collector, self.PATH) == 1.0
+
+        async def dying_send(_message):
+            raise OSError("Broken pipe")
+
+        with pytest.raises(OSError, match="Broken pipe"):
+            await response(None, None, dying_send)
+
+        assert self._inflight_value(collector, self.PATH) == 0.0, (
+            "a send() failure mid-stream (a real client disconnect) must "
+            "settle metrics at request exit, not only whenever the "
+            "abandoned generator happens to be garbage-collected"
+        )

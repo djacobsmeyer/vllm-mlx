@@ -1827,6 +1827,51 @@ def _metrics_path_for_request(request: Request) -> str:
     return "__unmatched__"
 
 
+class _MetricsFinishOnCallExit:
+    """Thin ASGI-callable wrapper around a response, so `on_call_end()` runs
+    once the response's own ASGI call returns OR raises, by any path.
+
+    This exists alongside `_metrics_middleware`'s `body_iterator` wrapping,
+    not instead of it -- the two cover different failure modes:
+
+    - `body_iterator` wrapping (in `_metrics_middleware` below) finishes
+      metrics when the body generator itself is exhausted, raises, or is
+      explicitly closed.
+    - This wrapper additionally covers a `send()` failure -- e.g. a genuine
+      client disconnect -- raised by the ASGI server *while consuming* that
+      body_iterator. Starlette's `_StreamingResponse.__call__` does
+      `async for chunk in self.body_iterator: await send(...)` with no
+      `try/finally` of its own, so when `send()` raises, the exception
+      propagates straight out and the generator is simply abandoned,
+      still suspended at its current `yield` -- neither `async for` nor a
+      propagating exception calls `aclose()` on it. Left alone, that
+      generator's own `finally` only runs whenever it happens to be
+      garbage-collected, which settles the metrics late and
+      unpredictably (confirmed: PR #782 review, Thump604, against a real
+      Starlette `_StreamingResponse.__call__`). Wrapping the *call* instead
+      of only the iterator settles metrics synchronously, exactly when the
+      request ends, regardless of which side (generator or `send()`) is
+      what actually fails.
+
+    `on_call_end` is idempotent (see `_metrics_middleware`), so whichever of
+    the two paths fires first wins and the other is a no-op.
+    """
+
+    def __init__(self, response, on_call_end):
+        self._response = response
+        self._on_call_end = on_call_end
+        self.status_code = response.status_code
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self._response(scope, receive, send)
+        finally:
+            self._on_call_end()
+
+
 @app.middleware("http")
 async def _metrics_middleware(request: Request, call_next):
     """Capture generic HTTP request metrics when enabled."""
@@ -1841,7 +1886,13 @@ async def _metrics_middleware(request: Request, call_next):
     start_time = time.perf_counter()
     _metrics.observe_http_start(method=method, path=path)
 
+    finished = False
+
     def finish(status_code: int) -> None:
+        nonlocal finished
+        if finished:
+            return
+        finished = True
         _metrics.observe_http_finish(
             method=method,
             path=path,
@@ -1864,7 +1915,7 @@ async def _metrics_middleware(request: Request, call_next):
     # decrement the in-flight gauge (and record request duration) within
     # milliseconds of request start for any streaming endpoint -- long
     # before real generation happens, let alone finishes. Defer the finish
-    # call until the body is actually exhausted, instead. `body_iterator` is
+    # call until the response is actually done, instead. `body_iterator` is
     # a private Starlette attribute (same caveat as `_find_uvicorn_cycle`
     # above); if a future Starlette drops it, fall back to the old
     # immediate-finish timing rather than raising.
@@ -1873,20 +1924,20 @@ async def _metrics_middleware(request: Request, call_next):
         finish(response.status_code)
         return response
 
-    finished = False
-
     async def tracked_body():
-        nonlocal finished
         try:
             async for chunk in body_iterator:
                 yield chunk
         finally:
-            if not finished:
-                finished = True
-                finish(response.status_code)
+            finish(response.status_code)
 
     response.body_iterator = tracked_body()
-    return response
+
+    # See `_MetricsFinishOnCallExit`: `tracked_body()` alone settles metrics
+    # on normal exhaustion or a generator-raised error, but not when the
+    # ASGI server's own `send()` fails mid-stream and abandons the iterator
+    # without closing it. Wrapping the call itself closes that gap.
+    return _MetricsFinishOnCallExit(response, lambda: finish(response.status_code))
 
 
 class RateLimiter:
