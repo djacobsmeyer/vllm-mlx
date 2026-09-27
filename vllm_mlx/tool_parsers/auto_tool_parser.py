@@ -116,8 +116,11 @@ class AutoToolParser(ToolParser):
         # 1c. Try GLM-4.7 native format (bare name after <tool_call>, not
         # JSON) before falling through to the Qwen/Hermes XML pattern below,
         # which expects a JSON object there instead.
-        if "<tool_call>" in model_output and self.GLM_NATIVE_PATTERN.search(
-            model_output
+        # Inspect the first opening tag only. Searching later tags can mistake
+        # literal GLM markup inside a Qwen/Hermes JSON argument for a tool call.
+        tool_call_start = model_output.find("<tool_call>")
+        if tool_call_start >= 0 and self.GLM_NATIVE_PATTERN.match(
+            model_output, tool_call_start
         ):
             glm_parser = Glm47ToolParser()
             result = glm_parser.extract_tool_calls(model_output, request)

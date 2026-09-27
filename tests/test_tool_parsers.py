@@ -1009,6 +1009,40 @@ class TestAutoToolParser:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["command"] == "ls"
 
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_qwen_argument_glm_markup_is_not_a_tool_call(self, parser, streaming):
+        """Native markup inside a JSON argument must remain literal text."""
+        arguments = {
+            "path": "example.txt",
+            "content": "<tool_call>Bash</tool_call>",
+        }
+        text = (
+            "<tool_call>"
+            + json.dumps({"name": "write_file", "arguments": arguments})
+            + "</tool_call>"
+        )
+        request = {
+            "tools": [
+                {"type": "function", "function": {"name": name}}
+                for name in ("write_file", "Bash")
+            ]
+        }
+
+        if streaming:
+            result = parser.extract_tool_calls_streaming(
+                "", text, text, request=request
+            )
+            assert result is not None
+            calls = [call["function"] for call in result["tool_calls"]]
+        else:
+            result = parser.extract_tool_calls(text, request)
+            assert result.tools_called
+            calls = result.tool_calls
+
+        assert len(calls) == 1
+        assert calls[0]["name"] == "write_file"
+        assert json.loads(calls[0]["arguments"]) == arguments
+
     def test_detects_llama(self, parser):
         """Test auto detection of Llama format."""
         text = '<function=multiply>{"x": 2}</function>'
