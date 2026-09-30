@@ -10,7 +10,10 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..mllm_specprefill import SpecPrefillOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,8 @@ class GenerationOutput:
     # Request-owned prompt positions supplied by a validated cache. None means
     # the engine did not provide request-level cache accounting.
     cached_tokens: int | None = None
+    # Request-level sparse-prefill decision and diagnostics.
+    specprefill_outcome: "SpecPrefillOutcome | None" = None
 
 
 class EngineBusy(RuntimeError):
