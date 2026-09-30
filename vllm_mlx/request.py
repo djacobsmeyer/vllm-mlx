@@ -116,12 +116,6 @@ class Request:
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
     prompt_cache_key: Optional[List[int]] = None  # Actual shared-cache entry key
     cached_tokens: int = 0  # Number of tokens retrieved from cache
-    # High-water mark of ``cached_tokens`` for this request. ``cached_tokens``
-    # reflects the *current* prefill reuse and can be cleared on cache
-    # fallback/retry paths, so we track the peak separately and report it in
-    # usage — otherwise the value observed at prefill would be lost by the time
-    # the final (streamed or aggregated) output is built.
-    peak_cached_tokens: int = 0
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
 
@@ -220,18 +214,20 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    # Prompt tokens served from the prefix/KV cache (prefix-cache reuse).
-    cached_tokens: int = 0
+    # Request-owned prompt positions supplied by a validated cache.
+    cached_tokens: int | None = None
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
 
     @property
-    def usage(self) -> Dict[str, int]:
+    def usage(self) -> Dict[str, Any]:
         """Return usage statistics compatible with OpenAI API."""
-        return {
+        usage: Dict[str, Any] = {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
-            "cached_tokens": self.cached_tokens,
         }
+        if self.cached_tokens is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": self.cached_tokens}
+        return usage

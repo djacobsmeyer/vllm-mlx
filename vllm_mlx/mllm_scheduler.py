@@ -77,6 +77,8 @@ class MLLMSchedulerConfig:
     use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
+    # Fraction of available memory used when no explicit MB limit is configured
+    prefix_cache_memory_percent: float = 0.20
     # KV cache quantization for prefix cache store/fetch
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -123,11 +125,8 @@ class MLLMRequest:
     num_output_tokens: int = 0
     mtp_drafts: int = 0
     mtp_accepted: int = 0
-    cached_tokens: int = 0  # Prompt tokens served from the prefix cache (0 = miss)
-    # High-water mark of cached_tokens across this request's responses. See
-    # the peak-tracking comment in the scheduler loop for why a separate
-    # field is needed rather than reading cached_tokens directly.
-    peak_cached_tokens: int = 0
+    # Request-owned prompt positions supplied from a validated cache.
+    cached_tokens: int | None = 0
 
     # Timing
     first_token_time: Optional[float] = None
@@ -258,52 +257,29 @@ class MLLMScheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Count of step() calls, mirroring AsyncEngineCore._steps_executed
+        # (engine_core.py) for the plain-LLM path -- surfaced via get_stats()
+        # as vllm_mlx_engine_steps_executed (see #746).
+        self._steps_executed = 0
 
         # Memory management: periodic mx.clear_cache() to free Metal buffers
         self._step_count = 0
         self._clear_cache_interval = 32
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer and generation_config.json."""
-        stop_tokens = set()
+        """Get stop token IDs from tokenizer and config/generation_config.
+
+        (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS, declared
+        only in the config EOS list — never as ``tokenizer.eos_token``.)
+        """
+        from .utils.tokenizer import collect_eos_token_ids
+
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
-
-        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-            if isinstance(tokenizer.eos_token_id, list):
-                stop_tokens.update(tokenizer.eos_token_id)
-            else:
-                stop_tokens.add(tokenizer.eos_token_id)
-
-        if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids is not None:
-            if isinstance(tokenizer.eos_token_ids, (list, set, tuple)):
-                stop_tokens.update(tokenizer.eos_token_ids)
-            else:
-                stop_tokens.add(tokenizer.eos_token_ids)
-
-        # Also read generation_config.json which may have additional EOS tokens
-        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
-        model_path = getattr(tokenizer, "name_or_path", None)
-        if model_path:
-            import json
-            from pathlib import Path
-
-            gc_path = Path(model_path) / "generation_config.json"
-            if gc_path.exists():
-                try:
-                    gc = json.loads(gc_path.read_text())
-                    gc_eos = gc.get("eos_token_id")
-                    if isinstance(gc_eos, list):
-                        stop_tokens.update(gc_eos)
-                    elif gc_eos is not None:
-                        stop_tokens.add(gc_eos)
-                except Exception:
-                    pass
-
-        return stop_tokens
+        return collect_eos_token_ids(tokenizer)
 
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
@@ -323,6 +299,7 @@ class MLLMScheduler:
             if self.config.enable_prefix_cache and self.config.use_memory_aware_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
+                    max_memory_percent=self.config.prefix_cache_memory_percent,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
@@ -500,6 +477,8 @@ class MLLMScheduler:
         if request is None:
             return False
 
+        request.cached_tokens = 0
+
         # Signal batch generator to abort any in-progress prefill for this
         # request.  The prefill loop checks _aborted_request_ids between
         # chunks and raises PrefillAbortedError to exit early.
@@ -663,6 +642,7 @@ class MLLMScheduler:
 
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
+                request.cached_tokens = 0
                 output = RequestOutput(
                     request_id=request_id,
                     new_token_ids=[],
@@ -672,6 +652,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    cached_tokens=0,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
                 request.output_text = ""
@@ -683,27 +664,17 @@ class MLLMScheduler:
                 continue
 
             # Append token to request
+            cached_tokens = getattr(response, "cached_tokens", None)
+            if type(cached_tokens) is not int:
+                cached_tokens = None
+            # Error responses continue above; normal token responses carry cache usage.
+            request.cached_tokens = cached_tokens
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
             if response.mtp_attempted:
                 request.mtp_drafts += response.mtp_attempted_count
             if response.from_draft:
                 request.mtp_accepted += 1
-            request.cached_tokens = response.cached_tokens
-
-            # Track the high-water mark of prefix-cache reuse, mirroring the
-            # LLM-path scheduler (see scheduler.py's identical comment).
-            # cached_tokens is established once at prefill on the primary
-            # response, but synthetic/deferred responses -- e.g. the MTP
-            # wrapper's appended draft-token responses at
-            # mllm_batch_generator.py's deferred-draft augmentation sites --
-            # carry no cache accounting of their own and default to 0. Emit
-            # the peak so a draft response never makes a cache hit read back
-            # as a miss.
-            request.peak_cached_tokens = max(
-                request.peak_cached_tokens, request.cached_tokens
-            )
-
             if request.first_token_time is None and request.num_output_tokens > 0:
                 request.first_token_time = time.time()
 
@@ -727,14 +698,7 @@ class MLLMScheduler:
                 output_token_ids=request.output_tokens,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
-                # Populated from MLLMBatchGenerator's fetch-site accounting via
-                # response.cached_tokens above; getattr kept defensively in
-                # case a future request type reaches this path without the
-                # field (e.g. the error-response branch's plain Request-less
-                # construction elsewhere in this method). peak_cached_tokens,
-                # not cached_tokens, so a zero-default deferred/draft
-                # response can't clobber an already-reported cache hit.
-                cached_tokens=getattr(request, "peak_cached_tokens", 0),
+                cached_tokens=request.cached_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
             )
@@ -867,6 +831,16 @@ class MLLMScheduler:
         # Clear finished tracking for next step
         self.finished_req_ids = set()
 
+        # Count only steps that complete without raising, mirroring
+        # AsyncEngineCore._steps_executed (engine_core.py), which increments
+        # after self.scheduler.step() returns successfully rather than
+        # before calling it. A step that raises partway through (e.g. an
+        # unrecoverable forward-pass error -- see
+        # _fail_requests_after_step_error) never did the scheduling/
+        # generation work "steps_executed" is meant to count, so it must
+        # not be counted.
+        self._steps_executed += 1
+
         return output
 
     def _fail_requests_after_step_error(self, error: Exception) -> None:
@@ -898,6 +872,7 @@ class MLLMScheduler:
                             completion_tokens=request.num_output_tokens,
                             mtp_drafts=request.mtp_drafts,
                             mtp_accepted=request.mtp_accepted,
+                            cached_tokens=None,
                         )
                     )
                 except asyncio.QueueFull:
@@ -1209,7 +1184,7 @@ class MLLMScheduler:
                     "tokens_per_second": None,
                     "ttft_s": None,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 
@@ -1254,7 +1229,7 @@ class MLLMScheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 
@@ -1269,6 +1244,7 @@ class MLLMScheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "steps_executed": self._steps_executed,
             "requests": self.get_running_requests_info(),
         }
 
@@ -1319,8 +1295,11 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.vision_cache is not None
+        ):
+            self.batch_generator.vision_cache.clear()
             cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
@@ -1345,8 +1324,7 @@ class MLLMScheduler:
         self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
+            if self.batch_generator.vision_cache is not None:
+                self.batch_generator.vision_cache.clear()
             self.batch_generator.close()
             self.batch_generator = None
-
-        if self.vision_cache:
-            self.vision_cache.clear()

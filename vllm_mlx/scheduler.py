@@ -136,6 +136,8 @@ class SchedulerConfig:
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
 
     def __post_init__(self) -> None:
+        if self.prefill_step_size <= 0:
+            raise ValueError("prefill_step_size must be > 0")
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
@@ -810,6 +812,19 @@ def _install_mtp(
        Reject: trim KVCache by 1, skip_state from pos 0 (no cold start)
     5. Draft is emitted in the NEXT generation step after primary
     """
+    # The MTP monkey-patch relies on BatchGenerator._step, which was
+    # refactored away in mlx-lm 0.31.x (decode now lives on
+    # GenerationBatch._step).  Skip gracefully when the required API is
+    # absent instead of crashing at generator creation — mirrors the
+    # chunked prefill compatibility guard.
+    if not hasattr(batch_gen, "_step"):
+        logger.warning(
+            "[MTP] disabled: mlx-lm BatchGenerator lacks the _step hook "
+            "required by the MTP monkey-patch (refactored in mlx-lm 0.31.x). "
+            "Generation continues without multi-token prediction."
+        )
+        return
+
     _orig_step = batch_gen._step
 
     # Greedy sampler for MTP draft tokens
@@ -2801,17 +2816,6 @@ class Scheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
-            # Track the high-water mark of prefix-cache reuse. ``cached_tokens``
-            # holds the reuse count set at prefill (memory-tier LCP hit, SSD-tier
-            # promotion, or legacy/paged hit); it can be cleared later on a
-            # cache-fallback/retry path, so we carry the peak forward. This is
-            # what lets the FINAL output — the finished streaming chunk as well
-            # as the aggregated non-streaming result — report cache reuse even
-            # though the streamed chunks are consumed one at a time.
-            request.peak_cached_tokens = max(
-                request.peak_cached_tokens, request.cached_tokens
-            )
-
             # Create output
             output = RequestOutput(
                 request_id=request_id,
@@ -2820,7 +2824,7 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
-                cached_tokens=request.peak_cached_tokens,
+                cached_tokens=request.cached_tokens,
             )
 
             # Check if finished
@@ -3692,7 +3696,7 @@ class Scheduler:
         Converts numpy arrays back to MLX arrays and creates KVCache objects.
         """
         try:
-            from mlx_lm.models.cache import ArraysCache, KVCache
+            from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
             # Cast restored arrays back to their original dtype if the spill
             # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
@@ -3700,27 +3704,34 @@ class Scheduler:
             def _mx_dtype_from_name(name: str):
                 return getattr(mx, name, None)
 
+            def _mk_kv(d: dict):
+                """Rebuild a KVCache from a deserialized layer/sub dict."""
+                kv = KVCache()
+                kv.keys = mx.array(d["keys"])
+                kv.values = mx.array(d["values"])
+                keys_orig = d.get("keys_original_dtype")
+                if keys_orig is not None:
+                    dt = _mx_dtype_from_name(keys_orig)
+                    if dt is not None:
+                        kv.keys = kv.keys.astype(dt)
+                values_orig = d.get("values_original_dtype")
+                if values_orig is not None:
+                    dt = _mx_dtype_from_name(values_orig)
+                    if dt is not None:
+                        kv.values = kv.values.astype(dt)
+                kv.offset = d["offset"]
+                for attr in ("max_size", "keep", "step", "_idx"):
+                    if attr in d:
+                        setattr(kv, attr, d[attr])
+                return kv
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
-                    kv = KVCache()
-                    kv.keys = mx.array(ld["keys"])
-                    kv.values = mx.array(ld["values"])
-                    keys_orig = ld.get("keys_original_dtype")
-                    if keys_orig is not None:
-                        dt = _mx_dtype_from_name(keys_orig)
-                        if dt is not None:
-                            kv.keys = kv.keys.astype(dt)
-                    values_orig = ld.get("values_original_dtype")
-                    if values_orig is not None:
-                        dt = _mx_dtype_from_name(values_orig)
-                        if dt is not None:
-                            kv.values = kv.values.astype(dt)
-                    kv.offset = ld["offset"]
-                    for attr in ("max_size", "keep", "step", "_idx"):
-                        if attr in ld:
-                            setattr(kv, attr, ld[attr])
-                    result.append(kv)
+                    result.append(_mk_kv(ld))
+                elif "cachelist_subs" in ld:
+                    # DSA CacheList: rebuild each KVCache sub and re-wrap.
+                    result.append(CacheList(*[_mk_kv(s) for s in ld["cachelist_subs"]]))
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
                     state_dtypes = ld.get("state_original_dtypes")

@@ -34,38 +34,32 @@ class TestCachedTokensDataModel:
         )
         assert usage.model_dump()["prompt_tokens_details"] == {"cached_tokens": 7}
 
-    def test_prompt_tokens_details_default_cached_zero(self):
-        assert PromptTokensDetails().cached_tokens == 0
-
     def test_request_output_carries_cached_tokens(self):
         out = RequestOutput(
             request_id="r", prompt_tokens=10, completion_tokens=2, cached_tokens=7
         )
         assert out.cached_tokens == 7
-        # The OpenAI-compatible usage dict exposes it too.
-        assert out.usage["cached_tokens"] == 7
+        assert out.usage["prompt_tokens_details"] == {"cached_tokens": 7}
 
     def test_generation_output_cached_tokens_default(self):
-        assert GenerationOutput(text="x").cached_tokens == 0
+        assert GenerationOutput(text="x").cached_tokens is None
 
-    def test_request_tracks_peak_cached_tokens(self):
+    def test_request_tracks_cached_tokens(self):
         req = Request(
             request_id="r",
             prompt="hi",
             sampling_params=SamplingParams(),
             cached_tokens=12,
-            peak_cached_tokens=12,
         )
-        assert req.peak_cached_tokens == 12
+        assert req.cached_tokens == 12
 
 
 class TestOutputCollectorMerge:
     """Aggregated streaming output must not drop the cache-reuse count."""
 
-    def test_merge_keeps_max_cached_tokens(self):
-        # Simulate the producer getting ahead of the consumer: the early step
-        # carries the prefix-cache reuse, a later step reports 0. The merged
-        # output the consumer eventually reads must retain the peak.
+    def test_merge_keeps_request_owned_cached_tokens(self):
+        # Every normal output carries the request-owned value, so the latest
+        # output remains authoritative when the collector aggregates chunks.
         collector = RequestOutputCollector(aggregate=True)
         collector.put(
             RequestOutput(
@@ -77,7 +71,7 @@ class TestOutputCollectorMerge:
                 request_id="r",
                 new_text="b",
                 completion_tokens=2,
-                cached_tokens=0,
+                cached_tokens=9,
                 finished=True,
             )
         )
@@ -106,9 +100,19 @@ class TestGetUsage:
         from vllm_mlx.server import get_usage
 
         usage = get_usage(
-            GenerationOutput(text="x", prompt_tokens=10, completion_tokens=2)
+            GenerationOutput(
+                text="x", prompt_tokens=10, completion_tokens=2, cached_tokens=0
+            )
         )
         assert usage.prompt_tokens_details.cached_tokens == 0
+
+    def test_get_usage_omits_unavailable_cache_accounting(self):
+        from vllm_mlx.server import get_usage
+
+        usage = get_usage(
+            GenerationOutput(text="x", prompt_tokens=10, completion_tokens=2)
+        )
+        assert "prompt_tokens_details" not in usage.model_dump()
 
 
 class TestChatCompletionCachedTokens:
@@ -244,8 +248,8 @@ class TestAbortAndReuseRequestId:
     A client is free to reuse a request ID once the previous request has
     finished/aborted; the request-lifetime contract is that ``add_request``
     always creates a brand-new ``MLLMRequest``, so ``cached_tokens`` and its
-    high-water mark ``peak_cached_tokens`` must start fresh at 0 rather than
-    inheriting whatever the aborted request last reported.
+    cache count must start fresh at 0 rather than inheriting whatever the
+    aborted request last reported.
     """
 
     def _make_scheduler(self):
@@ -278,7 +282,6 @@ class TestAbortAndReuseRequestId:
         # prefix-cache hit before the client disconnects mid-flight.
         first.status = RequestStatus.RUNNING
         first.cached_tokens = 42
-        first.peak_cached_tokens = 42
         scheduler.waiting.remove(first)
         scheduler.running[request_id] = first
         scheduler.request_id_to_uid[request_id] = 7
@@ -301,4 +304,3 @@ class TestAbortAndReuseRequestId:
         assert second is not first
         assert second.status == RequestStatus.WAITING
         assert second.cached_tokens == 0
-        assert second.peak_cached_tokens == 0

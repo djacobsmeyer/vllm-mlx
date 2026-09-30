@@ -78,6 +78,11 @@ class Message(BaseModel):
 
     role: str
     content: str | list[ContentPart] | list[dict] | None = None
+    # Preserve returned reasoning when assistant history is replayed to a template.
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     # For assistant messages with tool calls
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
@@ -188,6 +193,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
     logit_bias: dict[str, float] | None = None
+    # Per-request reasoning effort forwarded through chat template kwargs
+    reasoning_effort: str | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
@@ -253,14 +260,9 @@ class ChatCompletionChoice(BaseModel):
 
 
 class PromptTokensDetails(BaseModel):
-    """Breakdown of prompt tokens (OpenAI-compatible).
+    """Optional request-owned prompt cache usage."""
 
-    ``cached_tokens`` is the number of prompt tokens served from the prefix/KV
-    cache. This mirrors OpenAI's ``usage.prompt_tokens_details.cached_tokens``
-    so observability tools (Phoenix, Langfuse, ...) pick it up automatically.
-    """
-
-    cached_tokens: int = 0
+    cached_tokens: int
 
 
 class Usage(BaseModel):
@@ -269,9 +271,15 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    # Present whenever the serving path reports cache reuse; matches OpenAI,
-    # which always includes prompt_tokens_details when applicable.
     prompt_tokens_details: PromptTokensDetails | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler) -> dict:
+        """Omit cache details when request-level accounting is unavailable."""
+        data = handler(self)
+        if self.prompt_tokens_details is None:
+            data.pop("prompt_tokens_details", None)
+        return data
 
 
 class GenerationMetadata(BaseModel):

@@ -253,7 +253,7 @@ class MLLMBatchResponse:
     from_draft: bool = False  # True when this response is an accepted MTP draft
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
-    cached_tokens: int = 0  # Prompt tokens served from the prefix cache
+    cached_tokens: int | None = None  # Request-owned cached prompt positions
 
 
 @dataclass
@@ -922,11 +922,7 @@ class MLLMBatchGenerator:
             from .models.mllm import process_image_input
 
             for img in request.images:
-                try:
-                    path = process_image_input(img)
-                    all_images.append(path)
-                except Exception as e:
-                    logger.warning(f"Failed to process image: {e}")
+                all_images.append(process_image_input(img))
 
         if request.videos:
             from .models.mllm import (
@@ -938,27 +934,20 @@ class MLLMBatchGenerator:
             )
 
             for video in request.videos:
-                try:
-                    video_path = process_video_input(video)
-                    frames = extract_video_frames_smart(
-                        video_path,
-                        fps=DEFAULT_FPS,
-                        max_frames=MAX_FRAMES,
-                    )
-                    frame_paths = save_frames_to_temp(frames)
-                    all_images.extend(frame_paths)
-                except Exception as e:
-                    logger.warning(f"Failed to process video: {e}")
+                video_path = process_video_input(video)
+                frames = extract_video_frames_smart(
+                    video_path,
+                    fps=DEFAULT_FPS,
+                    max_frames=MAX_FRAMES,
+                )
+                frame_paths = save_frames_to_temp(frames)
+                all_images.extend(frame_paths)
 
         if request.audio:
             from .models.mllm import process_audio_input
 
             for audio in request.audio:
-                try:
-                    path = process_audio_input(audio)
-                    all_audio.append(path)
-                except Exception as e:
-                    logger.warning(f"Failed to process audio: {e}")
+                all_audio.append(process_audio_input(audio))
 
         # Check pixel cache first
         cached_pixels = None
@@ -1490,6 +1479,8 @@ class MLLMBatchGenerator:
 
         aborted_requests = []
         for req in requests:
+            # Request objects may be reused after a failed or aborted prefill.
+            req.cached_tokens = 0
             try:
                 # Check abort before starting prefill
                 if req.request_id in self._aborted_request_ids:
@@ -1667,10 +1658,11 @@ class MLLMBatchGenerator:
 
                     per_request_caches.append(request_cache)
                     req.vision_encoded = True
-                    req.cached_tokens = total_tokens - 1
+                    cached_count = total_tokens - 1
+                    req.cached_tokens = cached_count
                     logger.debug(
                         f"Prefix cache exact hit for {req.request_id}: "
-                        f"all {total_tokens} tokens cached"
+                        f"cached={cached_count}, last token replayed"
                     )
 
                 else:
@@ -2082,7 +2074,7 @@ class MLLMBatchGenerator:
                     logprobs=logprobs[i],
                     finish_reason=finish_reason,
                     prompt_cache=cache_fn,
-                    cached_tokens=getattr(req, "cached_tokens", 0),
+                    cached_tokens=req.cached_tokens,
                 )
             )
 
@@ -2802,6 +2794,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason="stop",
                                 from_draft=from_draft,
+                                cached_tokens=r.cached_tokens,
                             )
                         )
                         draft_end_uids.add(uid)
@@ -2826,6 +2819,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason=draft_finish,
                                 from_draft=from_draft,
+                                cached_tokens=r.cached_tokens,
                             )
                         )
 
@@ -2980,7 +2974,7 @@ def install_chunked_prefill_mllm(
                         if finish_reason is not None
                         else None
                     ),
-                    cached_tokens=getattr(req, "cached_tokens", 0),
+                    cached_tokens=req.cached_tokens,
                 )
             )
 
@@ -3069,7 +3063,27 @@ def install_chunked_prefill_mllm(
                         if r.input_ids is None:
                             try:
                                 batch_gen._preprocess_request(r)
-                            except Exception:
+                            except Exception as e:
+                                logger.error(
+                                    "Failed to preprocess request %s: %s",
+                                    r.request_id,
+                                    type(e).__name__,
+                                )
+                                # Keep the iteration stable for other requests.
+                                batch_gen.unprocessed_requests = [
+                                    pending
+                                    for pending in batch_gen.unprocessed_requests
+                                    if pending.uid != r.uid
+                                ]
+                                batch_gen._pending_error_responses.append(
+                                    MLLMBatchResponse(
+                                        uid=r.uid,
+                                        request_id=r.request_id,
+                                        token=0,
+                                        logprobs=mx.zeros(1),
+                                        finish_reason="error",
+                                    )
+                                )
                                 continue
                         if r.input_ids is not None and r.input_ids.size <= _budget:
                             short_reqs.append(r)
@@ -3087,11 +3101,8 @@ def install_chunked_prefill_mllm(
                                 f"inline short requests: {e}"
                             )
 
-                if batch_gen.active_batch is not None:
-                    return _generation_step()
-                else:
-                    # Idle server — yield to event loop between chunks
-                    return []
+                # Deliver preprocessing errors even with no active decode batch.
+                return _generation_step()
             else:
                 # Last chunk — finalize prefill
                 tic = time.perf_counter()
@@ -3227,6 +3238,7 @@ def install_chunked_prefill_mllm(
                     f"for {req.request_id[:12]}: "
                     f"{partial['total']} tokens in {partial['chunk_count']} chunks"
                 )
+                req.cached_tokens = partial["cached_count"]
                 batch_gen._partial = None
                 mx.clear_cache()
                 return _generation_step()
@@ -3250,6 +3262,7 @@ def install_chunked_prefill_mllm(
                     break
 
             if text_only_req is not None:
+                text_only_req.cached_tokens = 0
                 try:
                     # Preprocess to get input_ids
                     batch_gen._preprocess_request(text_only_req)
@@ -3391,7 +3404,9 @@ def install_chunked_prefill_mllm(
 
     def _patched_remove(uids: List[int]) -> None:
         if batch_gen._partial is not None:
-            if batch_gen._partial["request"].uid in set(uids):
+            partial_request = batch_gen._partial["request"]
+            if partial_request.uid in set(uids):
+                partial_request.cached_tokens = 0
                 batch_gen._partial = None
                 mx.clear_cache()
         _orig_remove(uids)
