@@ -129,6 +129,82 @@ class TestBatchedEngineCacheRestore:
         prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")
 
 
+class TestBatchedEngineAnthropicImages:
+    """Anthropic images alongside tool calls must reach generation."""
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("source_type", ["base64", "url"])
+    async def test_image_with_tool_use_reaches_generation(
+        self, monkeypatch, stream, source_type
+    ):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+            engine = BatchedEngine("test-mllm")
+        engine._loaded = True
+
+        source = (
+            {"type": "base64", "media_type": "image/png", "data": "YWJj"}
+            if source_type == "base64"
+            else {"type": "url", "url": "https://example.com/image.png"}
+        )
+        expected_image = (
+            "data:image/png;base64,YWJj"
+            if source_type == "base64"
+            else "https://example.com/image.png"
+        )
+        request = anthropic_to_openai(
+            AnthropicRequest(
+                model="test-mllm",
+                max_tokens=16,
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "image", "source": source},
+                            {
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "zoom",
+                                "input": {"scale": 2},
+                            },
+                        ],
+                    }
+                ],
+            )
+        )
+        messages = [
+            message.model_dump(exclude_none=True) for message in request.messages
+        ]
+        captured = {}
+
+        def template(_messages, _tools, **kwargs):
+            captured["num_images"] = kwargs["num_images"]
+            return "fixture prompt"
+
+        async def generate(**kwargs):
+            captured["images"] = kwargs["images"]
+            return GenerationOutput(text="ok", finished=True)
+
+        async def stream_generate(**kwargs):
+            yield await generate(**kwargs)
+
+        monkeypatch.setattr(engine, "_apply_chat_template", template)
+        monkeypatch.setattr(engine, "generate", generate)
+        monkeypatch.setattr(engine, "stream_generate", stream_generate)
+        if stream:
+            outputs = [output async for output in engine.stream_chat(messages)]
+        else:
+            outputs = [await engine.chat(messages)]
+
+        assert outputs[0].text == "ok"
+        assert captured == {"num_images": 1, "images": [expected_image]}
+
+
 class TestBatchedEngineMetalCacheLimit:
     def test_prefers_explicit_mlx_buffer_cache_limit(self, monkeypatch):
         from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
