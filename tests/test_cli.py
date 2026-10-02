@@ -349,9 +349,11 @@ class TestServeCommandMllmRouting:
         with caplog.at_level("INFO"):
             cli.serve_command(_serve_args(model="mlx-community/Qwen3.8-27B-8bit"))
 
-        assert loaded["args"][0] == str(model_dir)
+        # Identity stays the repo id; the snapshot travels separately as the
+        # load path so name-keyed defaults never see the cache directory.
+        assert loaded["args"][0] == "mlx-community/Qwen3.8-27B-8bit"
+        assert loaded["kwargs"]["model_path"] == str(model_dir)
         assert loaded["kwargs"]["force_mllm"] is True
-        assert loaded["kwargs"]["served_model_name"] == "mlx-community/Qwen3.8-27B-8bit"
         assert "MLLM" in caplog.text
         assert "source=config" in caplog.text
 
@@ -443,3 +445,78 @@ class TestServeCommandMllmRouting:
 
         assert loaded["kwargs"]["force_mllm"] is True
         assert "source=explicit" in caplog.text
+
+    def test_snapshot_under_coder_path_keeps_thinking_default(
+        self, tmp_path, monkeypatch
+    ):
+        """#780 review: with continuous batching, a non-Coder Qwen3 repo whose
+        snapshot happens to live under a path containing "coder" must keep the
+        enable_thinking=True default it had before resolve-before-route.
+
+        Runs the real serve_command -> server.load_model -> BatchedEngine
+        chain; only the download and the tokenizer are stubbed.
+        """
+        from vllm_mlx import cli, server
+        from vllm_mlx.utils import download
+
+        snapshot = (
+            tmp_path
+            / "Users"
+            / "coder"
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--mlx-community--Qwen3-8B-4bit"
+            / "snapshots"
+            / "abc123"
+        )
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]})
+        )
+        monkeypatch.setattr(
+            download, "ensure_model_downloaded", lambda *a, **k: snapshot
+        )
+        monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+        # load_model mutates module globals; restore them after the test.
+        for name in (
+            "_engine",
+            "_model_manager",
+            "_model_name",
+            "_model_path",
+            "_default_model_key",
+            "_default_max_tokens",
+            "_max_request_tokens",
+            "_force_mllm_model",
+            "_auto_unload_idle_seconds",
+            "_lazy_load_model",
+            "_residency_manager",
+            "_warm_prompts_path",
+            "_tool_parser_instance",
+        ):
+            monkeypatch.setattr(server, name, getattr(server, name))
+        monkeypatch.setattr(server, "_engine", None)
+        monkeypatch.setattr(server, "_residency_manager", None)
+
+        cli.serve_command(
+            _serve_args(
+                model="mlx-community/Qwen3-8B-4bit",
+                continuous_batching=True,
+                mllm_prefill_step_size=0,
+            )
+        )
+
+        engine = server._engine
+        seen = {}
+
+        class _Tokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                seen.update(kwargs)
+                return "prompt"
+
+        engine._tokenizer = _Tokenizer()
+        engine._apply_chat_template([{"role": "user", "content": "hi"}])
+
+        assert seen["enable_thinking"] is True
+        assert engine.model_name == "mlx-community/Qwen3-8B-4bit"
+        assert server._model_name == "mlx-community/Qwen3-8B-4bit"
