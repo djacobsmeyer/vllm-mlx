@@ -88,6 +88,7 @@ jobs:
             tests/test_audio.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
+            tests/test_video_audio_extraction.py \
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
@@ -95,6 +96,7 @@ jobs:
             tests/test_mllm_assistant_images.py \
             tests/test_mllm_message_ordering.py \
             tests/test_anthropic_adapter_canonicalization.py \
+            tests/test_mllm_stream_usage.py \
             tests/test_dependency_floors.py \
             tests/test_ssd_cache_shutdown.py \
             tests/test_chat_template_safety.py \
@@ -159,6 +161,7 @@ jobs:
         run: |
           pytest \
             tests/test_mllm_steps_executed_stat.py \
+            tests/test_mllm_scheduler_stop_release.py \
             -v --tb=short
 
       - name: Run hybrid boundary checkpoint regressions
@@ -234,6 +237,7 @@ jobs:
             tests/test_mllm_sampling.py \
             tests/test_mllm_assistant_images.py \
             tests/test_mllm_steps_executed_stat.py \
+            tests/test_mllm_scheduler_stop_release.py \
             tests/test_metrics.py \
             tests/test_optimizations.py \
             tests/test_batched_engine.py \
